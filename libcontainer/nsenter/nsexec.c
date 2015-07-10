@@ -51,6 +51,26 @@ int setns(int fd, int nstype)
 #endif
 #endif
 
+int ns_name_to_id(char * name) {
+	typedef struct item_t { const char * name; int value; } item_t;
+	item_t table[] = {
+		{ "NEWPID", CLONE_NEWPID },
+		{ "NEWUTS", CLONE_NEWUTS },
+		{ "NEWIPC", CLONE_NEWIPC },
+		{ "NEWNET", CLONE_NEWNET },
+		{ "NEWNS", CLONE_NEWNS },
+		{ "NEWUSER", CLONE_NEWUSER },
+		{ NULL, -1 },
+	};
+	item_t * p;
+	for (p = table; p->name != NULL; ++p) {
+		if (strcmp(p->name, name) == 0) {
+			return p->value;
+		}
+	}
+	return -1;
+}
+
 static int clone_parent(jmp_buf * env) __attribute__ ((noinline));
 static int clone_parent(jmp_buf * env)
 {
@@ -80,7 +100,7 @@ void nsexec()
 {
 	jmp_buf env;
 	char buf[PATH_MAX], *val, *nspaths;
-	int nsLen, child, len, pipenum, consolefd = -1;
+	int nsLen, child, len, pipenum, rpipenum, consolefd = -1;
 	char *console;
 
 	// _LIBCONTAINER_NSPATH if exists is a comma-separated list of namespaces
@@ -89,10 +109,11 @@ void nsexec()
 	if (nspaths == NULL) {
 		return;
 	}
+
 	// get the init pipe to communicate with parent
 	val = getenv("_LIBCONTAINER_INITPIPE");
 	if (val == NULL) {
-		pr_perror("Child pipe not found");
+		pr_perror("Write pipe not found");
 		exit(1);
 	}
 	pipenum = atoi(val);
@@ -101,6 +122,20 @@ void nsexec()
 		pr_perror("Unable to parse _LIBCONTAINER_INITPIPE");
 		exit(1);
 	}
+
+	// get the init pipe to communicate with parent
+	val = getenv("_LIBCONTAINER_INITPIPE_READ");
+	if (val == NULL) {
+		pr_perror("Read pipe not found");
+		exit(1);
+	}
+	rpipenum = atoi(val);
+	snprintf(buf, sizeof(buf), "%d", rpipenum);
+	if (strcmp(val, buf)) {
+		pr_perror("Unable to parse _LIBCONTAINER_INITPIPE_READ");
+		exit(1);
+	}
+
 	// get the console path before setns because it may change mnt namespace
 	console = getenv("_LIBCONTAINER_CONSOLE_PATH");
 	if (console != NULL) {
@@ -110,12 +145,15 @@ void nsexec()
 			exit(1);
 		}
 	}
+
 	// open all namespaces' descriptors and perform setns on them
 	nsLen = namespacesLength(nspaths);
 	if (nsLen == 0) {
 		return;
 	}
+
 	int fds[nsLen];
+	int unshares[nsLen];
 	char *nsList[nsLen];
 	int i, j, savedErr = -1;
 	char *ns, *saveptr;
@@ -124,34 +162,86 @@ void nsexec()
 		if (ns == NULL) {
 			break;
 		}
+		nspaths = NULL;
+
+		unshares[i] = ns_name_to_id(ns);
+		if(unshares[i] != -1) {
+			fds[i] = -1;
+			continue;
+		}
+
 		fds[i] = open(ns, O_RDONLY);
 		if (fds[i] == -1) {
 			savedErr = errno;
 			// failed to open a particular path, we need to close all opened
 			// file descriptors
 			for (j = 0; j < i; j++) {
-				close(fds[j]);
+				if (fds[j] != -1) {
+					close(fds[j]);
+				}
 			}
 			errno = savedErr;
 			pr_perror("Failed to open %s", ns);
 			exit(1);
 		}
 		nsList[i] = ns;
-		nspaths = NULL;
 	}
 	for (i = 0; i < nsLen; i++) {
-		if (fds[i] != -1 && setns(fds[i], 0) != 0) {
-			savedErr = errno;
-			// failed to setns, we need to close all opended file descriptors
-			for (j = 0; j < nsLen; j++) {
-				close(fds[j]);
+		if (fds[i] == -1) {
+			if (unshare(unshares[i]) != 0) {
+				savedErr = errno;
+				// failed to unshare, we need to close all opened file descriptors
+				for (j = i; j < nsLen; j++) {
+					if (fds[j] != -1) {
+						close(fds[j]);
+					}
+				}
+				errno = savedErr;
+				pr_perror("Failed to ushare %s", nsList[i]);
+				exit(1);
 			}
-			errno = savedErr;
-			pr_perror("Failed to setns to %s", nsList[i]);
+		} else {
+			if (setns(fds[i], 0) != 0) {
+				savedErr = errno;
+				// failed to setns, we need to close all opened file descriptors
+				for (j = i; j < nsLen; j++) {
+					if (fds[j] != -1) {
+						close(fds[j]);
+					}
+				}
+				errno = savedErr;
+				pr_perror("Failed to setns to %s", nsList[i]);
+				exit(1);
+			}
+			close(fds[i]);
+		}
+	}
+
+	// let parent know that we have unshared
+	if (write(pipenum, "X", 1) != 1) {
+		pr_perror("Unable to send sync data to parent");
+		exit(1);
+	}
+
+	// wait for parent to set uid_map and gid_map
+	if (read(rpipenum, buf, 1) != 0) {
+		pr_perror("Unable to read from pipe");
+		exit(1);
+	}
+
+	// if we entered a new namespace, switch to mapped root
+	val = getenv("_LIBCONTAINER_SETUID");
+	if (val == NULL || strcmp(val, "true") == 0) {
+		if (setuid(0) == -1) {
+			pr_perror("setuid failed");
 			exit(1);
 		}
-		close(fds[i]);
+		if (setgid(0) == -1) {
+			pr_perror("setgid failed");
+			exit(1);
+		}
 	}
+
 	// if we dont need to clone, then just let the Go runtime take over
 	val = getenv("_LIBCONTAINER_DOCLONE");
 	if (val == NULL || strcmp(val, "true") != 0) {

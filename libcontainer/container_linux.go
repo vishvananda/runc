@@ -123,17 +123,21 @@ func (c *linuxContainer) newParentProcess(p *Process, doInit bool) (parentProces
 	if err != nil {
 		return nil, newSystemError(err)
 	}
-	cmd, err := c.commandTemplate(p, childPipe)
+	childRevPipe, parentRevPipe, err := newPipe()
+	if err != nil {
+		return nil, newSystemError(err)
+	}
+	cmd, err := c.commandTemplate(p, childRevPipe, childPipe)
 	if err != nil {
 		return nil, newSystemError(err)
 	}
 	if !doInit {
-		return c.newSetnsProcess(p, cmd, parentPipe, childPipe)
+		return c.newSetnsProcess(p, cmd, parentPipe, childPipe, parentRevPipe, childRevPipe)
 	}
-	return c.newInitProcess(p, cmd, parentPipe, childPipe)
+	return c.newInitProcess(p, cmd, parentPipe, childPipe, parentRevPipe, childRevPipe)
 }
 
-func (c *linuxContainer) commandTemplate(p *Process, childPipe *os.File) (*exec.Cmd, error) {
+func (c *linuxContainer) commandTemplate(p *Process, childRevPipe, childPipe *os.File) (*exec.Cmd, error) {
 	cmd := &exec.Cmd{
 		Path: c.initPath,
 		Args: c.initArgs,
@@ -145,7 +149,8 @@ func (c *linuxContainer) commandTemplate(p *Process, childPipe *os.File) (*exec.
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	cmd.ExtraFiles = append(p.ExtraFiles, childPipe)
+	cmd.ExtraFiles = append(p.ExtraFiles, childRevPipe, childPipe)
+	cmd.Env = append(cmd.Env, fmt.Sprintf("_LIBCONTAINER_INITPIPE_READ=%d", stdioFdCount+len(cmd.ExtraFiles)-2))
 	cmd.Env = append(cmd.Env, fmt.Sprintf("_LIBCONTAINER_INITPIPE=%d", stdioFdCount+len(cmd.ExtraFiles)-1))
 	// NOTE: when running a container with no PID namespace and the parent process spawning the container is
 	// PID1 the pdeathsig is being delivered to the container's init process by the kernel for some reason
@@ -156,31 +161,24 @@ func (c *linuxContainer) commandTemplate(p *Process, childPipe *os.File) (*exec.
 	return cmd, nil
 }
 
-func (c *linuxContainer) newInitProcess(p *Process, cmd *exec.Cmd, parentPipe, childPipe *os.File) (*initProcess, error) {
-	cloneFlags := c.config.Namespaces.CloneFlags()
-	if cloneFlags&syscall.CLONE_NEWUSER != 0 {
-		if err := c.addUidGidMappings(cmd.SysProcAttr); err != nil {
-			// user mappings are not supported
-			return nil, err
-		}
-		// Default to root user when user namespaces are enabled.
-		if cmd.SysProcAttr.Credential == nil {
-			cmd.SysProcAttr.Credential = &syscall.Credential{}
-		}
-	}
-	cmd.SysProcAttr.Cloneflags = cloneFlags
-
+func (c *linuxContainer) newInitProcess(p *Process, cmd *exec.Cmd, parentPipe, childPipe, parentRevPipe, childRevPipe *os.File) (*initProcess, error) {
 	// set init process environment
 	env := []string{"_LIBCONTAINER_INITTYPE=standard"}
-	var joinNamespaces configs.Namespaces
+
 	var doClone bool
 	nsMaps := make(map[configs.NamespaceType]string)
 	for _, ns := range c.config.Namespaces {
-		if ns.Path != "" {
-			nsMaps[ns.Type] = ns.Path
-			joinNamespaces = append(joinNamespaces, ns)
-			if ns.Type == configs.NEWPID {
-				doClone = true
+		nsMaps[ns.Type] = ns.Path
+		if ns.Type == configs.NEWPID {
+			doClone = true
+		}
+		if ns.Type == configs.NEWUSER {
+			env = append(env, "_LIBCONTAINER_SETUID=true")
+			if ns.Path == "" {
+				if err := c.addUidGidMappings(cmd.SysProcAttr); err != nil {
+					// user mappings are not supported
+					return nil, err
+				}
 			}
 		}
 	}
@@ -198,17 +196,18 @@ func (c *linuxContainer) newInitProcess(p *Process, cmd *exec.Cmd, parentPipe, c
 	cmd.Env = append(cmd.Env, env...)
 
 	return &initProcess{
-		cmd:            cmd,
-		childPipe:      childPipe,
-		parentPipe:     parentPipe,
-		manager:        c.cgroupManager,
-		config:         c.newInitConfig(p),
-		joinNamespaces: joinNamespaces,
-		doClone:        doClone,
+		cmd:           cmd,
+		childPipe:     childPipe,
+		parentPipe:    parentPipe,
+		childRevPipe:  childRevPipe,
+		parentRevPipe: parentRevPipe,
+		manager:       c.cgroupManager,
+		config:        c.newInitConfig(p),
+		doClone:       doClone,
 	}, nil
 }
 
-func (c *linuxContainer) newSetnsProcess(p *Process, cmd *exec.Cmd, parentPipe, childPipe *os.File) (*setnsProcess, error) {
+func (c *linuxContainer) newSetnsProcess(p *Process, cmd *exec.Cmd, parentPipe, childPipe, parentRevPipe, childRevPipe *os.File) (*setnsProcess, error) {
 	state, err := c.currentState()
 	if err != nil {
 		return nil, newSystemError(err)
@@ -228,11 +227,13 @@ func (c *linuxContainer) newSetnsProcess(p *Process, cmd *exec.Cmd, parentPipe, 
 	}
 	// TODO: set on container for process management
 	return &setnsProcess{
-		cmd:         cmd,
-		cgroupPaths: c.cgroupManager.GetPaths(),
-		childPipe:   childPipe,
-		parentPipe:  parentPipe,
-		config:      c.newInitConfig(p),
+		cmd:           cmd,
+		cgroupPaths:   c.cgroupManager.GetPaths(),
+		childPipe:     childPipe,
+		parentPipe:    parentPipe,
+		childRevPipe:  childRevPipe,
+		parentRevPipe: parentRevPipe,
+		config:        c.newInitConfig(p),
 	}, nil
 }
 
@@ -823,22 +824,23 @@ func (c *linuxContainer) currentState() (*State, error) {
 func (c *linuxContainer) orderNamespacePaths(namespaces map[configs.NamespaceType]string, doInit bool) ([]string, error) {
 	paths := []string{}
 	nsTypes := []configs.NamespaceType{
+		configs.NEWUSER,
 		configs.NEWIPC,
 		configs.NEWUTS,
 		configs.NEWNET,
 		configs.NEWPID,
 		configs.NEWNS,
 	}
-	// For now, only join user namespace if this is an exec in process and the
-	// container supports user namespace
-	if !doInit && c.config.Namespaces.Contains(configs.NEWUSER) {
-		nsTypes = append(nsTypes, configs.NEWUSER)
-	}
 	for _, nsType := range nsTypes {
-		if p, ok := namespaces[nsType]; ok && p != "" {
+		if p, ok := namespaces[nsType]; ok {
 			// check if the requested namespace is supported
 			if !configs.IsNamespaceSupported(nsType) {
 				return nil, newSystemError(fmt.Errorf("namespace %s is not supported", nsType))
+			}
+			// if there is no path set a string to force unshare
+			if p == "" {
+				paths = append(paths, string(nsType))
+				continue
 			}
 			// only set to join this namespace if it exists
 			if _, err := os.Lstat(p); err != nil {

@@ -16,6 +16,10 @@ func (c Config) HostUID() (int, error) {
 			return -1, fmt.Errorf("User namespaces enabled, but no root user mapping found.")
 		}
 		return id, nil
+	} else {
+		if c.UidMappings != nil {
+			return -1, fmt.Errorf("User mappings found, but user namespace is not enabled")
+		}
 	}
 	// Return default root uid 0
 	return 0, nil
@@ -33,6 +37,10 @@ func (c Config) HostGID() (int, error) {
 			return -1, fmt.Errorf("User namespaces enabled, but no root user mapping found.")
 		}
 		return id, nil
+	} else {
+		if c.GidMappings != nil {
+			return -1, fmt.Errorf("Gid mappings found, but user namespace is not enabled")
+		}
 	}
 	// Return default root uid 0
 	return 0, nil

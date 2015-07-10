@@ -41,12 +41,14 @@ type parentProcess interface {
 }
 
 type setnsProcess struct {
-	cmd         *exec.Cmd
-	parentPipe  *os.File
-	childPipe   *os.File
-	cgroupPaths map[string]string
-	config      *initConfig
-	fds         []string
+	cmd           *exec.Cmd
+	parentPipe    *os.File
+	childPipe     *os.File
+	parentRevPipe *os.File
+	childRevPipe  *os.File
+	cgroupPaths   map[string]string
+	config        *initConfig
+	fds           []string
 }
 
 func (p *setnsProcess) startTime() (string, error) {
@@ -63,6 +65,23 @@ func (p *setnsProcess) signal(sig os.Signal) error {
 
 func (p *setnsProcess) start() (err error) {
 	defer p.parentPipe.Close()
+	defer p.parentRevPipe.Close()
+	err = p.cmd.Start()
+	p.childPipe.Close()
+	p.childRevPipe.Close()
+	if err != nil {
+		return newSystemError(err)
+	}
+	// wait for the child to execute unshare
+	var data = make([]byte, 1)
+	_, err = p.parentPipe.Read(data)
+	if err != nil {
+		return newSystemError(err)
+	}
+
+	// no need to write mappings
+
+	p.parentRevPipe.Close()
 	if err = p.execSetns(); err != nil {
 		return newSystemError(err)
 	}
@@ -95,11 +114,6 @@ func (p *setnsProcess) start() (err error) {
 // before the go runtime boots, we wait on the process to die and receive the child's pid
 // over the provided pipe.
 func (p *setnsProcess) execSetns() error {
-	err := p.cmd.Start()
-	p.childPipe.Close()
-	if err != nil {
-		return newSystemError(err)
-	}
 	status, err := p.cmd.Process.Wait()
 	if err != nil {
 		p.cmd.Wait()
@@ -159,18 +173,16 @@ func (p *setnsProcess) setExternalDescriptors(newFds []string) {
 }
 
 type initProcess struct {
-	cmd        *exec.Cmd
-	parentPipe *os.File
-	childPipe  *os.File
-	config     *initConfig
-	manager    cgroups.Manager
-	container  *linuxContainer
-	fds        []string
-
-	// joinNamespaces are additional namespaces that the init process will join
-	// instead of creating new ones
-	joinNamespaces configs.Namespaces
-	doClone        bool
+	cmd           *exec.Cmd
+	parentPipe    *os.File
+	childPipe     *os.File
+	parentRevPipe *os.File
+	childRevPipe  *os.File
+	config        *initConfig
+	manager       cgroups.Manager
+	container     *linuxContainer
+	fds           []string
+	doClone       bool
 }
 
 func (p *initProcess) pid() int {
@@ -196,6 +208,7 @@ func (p *initProcess) execSetns() error {
 		p.cmd.Wait()
 		return &exec.ExitError{ProcessState: status}
 	}
+
 	var pid *pid
 	if err := json.NewDecoder(p.parentPipe).Decode(&pid); err != nil {
 		p.cmd.Wait()
@@ -209,15 +222,67 @@ func (p *initProcess) execSetns() error {
 	return nil
 }
 
+func writeIDMappings(path string, idMap []syscall.SysProcIDMap) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	for _, im := range idMap {
+		data := strconv.Itoa(im.ContainerID) + " " + strconv.Itoa(im.HostID) + " " + strconv.Itoa(im.Size) + "\n"
+		if _, err = f.Write([]byte(data)); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func writeUidGidMappings(pid int, sys *syscall.SysProcAttr) error {
+	if sys.UidMappings != nil {
+		uidf := "/proc/" + strconv.Itoa(pid) + "/uid_map"
+		if err := writeIDMappings(uidf, sys.UidMappings); err != nil {
+			return err
+		}
+	}
+
+	if sys.GidMappings != nil {
+		gidf := "/proc/" + strconv.Itoa(pid) + "/gid_map"
+		if err := writeIDMappings(gidf, sys.GidMappings); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (p *initProcess) start() error {
 	defer p.parentPipe.Close()
+	defer p.parentRevPipe.Close()
+	sys := *p.cmd.SysProcAttr
+	p.cmd.SysProcAttr.UidMappings = nil
+	p.cmd.SysProcAttr.GidMappings = nil
 	err := p.cmd.Start()
 	p.childPipe.Close()
+	p.childRevPipe.Close()
 	if err != nil {
 		return newSystemError(err)
 	}
+	// wait for the child to execute unshare
+	var data = make([]byte, 1)
+	_, err = p.parentPipe.Read(data)
+	if err != nil {
+		return newSystemError(err)
+	}
+	err = writeUidGidMappings(p.pid(), &sys)
+	if err != nil {
+		return newSystemError(err)
+	}
+	// close the reverse pipe so the child continues
+	p.parentRevPipe.Close()
 	// if we need to clone a new child process
-	if len(p.joinNamespaces) > 0 && p.doClone {
+	if p.doClone {
 		if err := p.execSetns(); err != nil {
 			return newSystemError(err)
 		}
@@ -266,7 +331,7 @@ func (p *initProcess) wait() (*os.ProcessState, error) {
 		return p.cmd.ProcessState, err
 	}
 	// we should kill all processes in cgroup when init is died if we use host PID namespace
-	if p.cmd.SysProcAttr.Cloneflags&syscall.CLONE_NEWPID == 0 {
+	if p.doClone && p.config.Config.Namespaces.PathOf(configs.NEWPID) == "" {
 		killCgroupProcesses(p.manager)
 	}
 	return p.cmd.ProcessState, nil
