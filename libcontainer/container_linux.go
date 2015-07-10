@@ -131,10 +131,67 @@ func (c *linuxContainer) newParentProcess(p *Process, doInit bool) (parentProces
 	if err != nil {
 		return nil, newSystemError(err)
 	}
-	if !doInit {
-		return c.newSetnsProcess(p, cmd, parentPipe, childPipe, parentRevPipe, childRevPipe)
+
+	// set init process environment
+	env := []string{}
+	var doClone bool
+	nsMaps := make(map[configs.NamespaceType]string)
+
+	if doInit {
+		env = append(env, "_LIBCONTAINER_INITTYPE=standard")
+		for _, ns := range c.config.Namespaces {
+			nsMaps[ns.Type] = ns.Path
+			if ns.Type == configs.NEWPID {
+				doClone = true
+				env = append(env, "_LIBCONTAINER_DOCLONE=true")
+			}
+			if ns.Type == configs.NEWUSER {
+				env = append(env, "_LIBCONTAINER_SETUID=true")
+				if ns.Path == "" {
+					if err := c.addUidGidMappings(cmd.SysProcAttr); err != nil {
+						// user mappings are not supported
+						return nil, err
+					}
+				}
+			}
+		}
+	} else {
+		doClone = true
+		env = append(env, "_LIBCONTAINER_INITTYPE=setns")
+		env = append(env, "_LIBCONTAINER_DOCLONE=true")
+		env = append(env, "_LIBCONTAINER_SETSID=true")
+		if p.consolePath != "" {
+			cmd.Env = append(cmd.Env, "_LIBCONTAINER_CONSOLE_PATH="+p.consolePath)
+		}
+		state, err := c.currentState()
+		if err != nil {
+			return nil, newSystemError(err)
+		}
+		nsMaps = state.NamespacePaths
 	}
-	return c.newInitProcess(p, cmd, parentPipe, childPipe, parentRevPipe, childRevPipe)
+	if len(nsMaps) > 0 {
+		nsPaths, err := c.orderNamespacePaths(nsMaps, true)
+		if err != nil {
+			return nil, newSystemError(err)
+		}
+		env = append(env, fmt.Sprintf("_LIBCONTAINER_NSPATH=%s",
+			strings.Join(nsPaths, ",")))
+	}
+
+	cmd.Env = append(cmd.Env, env...)
+
+	return &initProcess{
+		cmd:           cmd,
+		cgroupPaths:   c.cgroupManager.GetPaths(),
+		childPipe:     childPipe,
+		parentPipe:    parentPipe,
+		childRevPipe:  childRevPipe,
+		parentRevPipe: parentRevPipe,
+		manager:       c.cgroupManager,
+		config:        c.newInitConfig(p),
+		doClone:       doClone,
+		doInit:        doInit,
+	}, nil
 }
 
 func (c *linuxContainer) commandTemplate(p *Process, childRevPipe, childPipe *os.File) (*exec.Cmd, error) {
@@ -159,82 +216,6 @@ func (c *linuxContainer) commandTemplate(p *Process, childRevPipe, childPipe *os
 		cmd.SysProcAttr.Pdeathsig = syscall.Signal(c.config.ParentDeathSignal)
 	}
 	return cmd, nil
-}
-
-func (c *linuxContainer) newInitProcess(p *Process, cmd *exec.Cmd, parentPipe, childPipe, parentRevPipe, childRevPipe *os.File) (*initProcess, error) {
-	// set init process environment
-	env := []string{"_LIBCONTAINER_INITTYPE=standard"}
-
-	var doClone bool
-	nsMaps := make(map[configs.NamespaceType]string)
-	for _, ns := range c.config.Namespaces {
-		nsMaps[ns.Type] = ns.Path
-		if ns.Type == configs.NEWPID {
-			doClone = true
-		}
-		if ns.Type == configs.NEWUSER {
-			env = append(env, "_LIBCONTAINER_SETUID=true")
-			if ns.Path == "" {
-				if err := c.addUidGidMappings(cmd.SysProcAttr); err != nil {
-					// user mappings are not supported
-					return nil, err
-				}
-			}
-		}
-	}
-	if len(nsMaps) > 0 {
-		nsPaths, err := c.orderNamespacePaths(nsMaps, true)
-		if err != nil {
-			return nil, err
-		}
-		env = append(env, fmt.Sprintf("_LIBCONTAINER_NSPATH=%s",
-			strings.Join(nsPaths, ",")))
-	}
-	if doClone {
-		env = append(env, "_LIBCONTAINER_DOCLONE=true")
-	}
-	cmd.Env = append(cmd.Env, env...)
-
-	return &initProcess{
-		cmd:           cmd,
-		childPipe:     childPipe,
-		parentPipe:    parentPipe,
-		childRevPipe:  childRevPipe,
-		parentRevPipe: parentRevPipe,
-		manager:       c.cgroupManager,
-		config:        c.newInitConfig(p),
-		doClone:       doClone,
-	}, nil
-}
-
-func (c *linuxContainer) newSetnsProcess(p *Process, cmd *exec.Cmd, parentPipe, childPipe, parentRevPipe, childRevPipe *os.File) (*setnsProcess, error) {
-	state, err := c.currentState()
-	if err != nil {
-		return nil, newSystemError(err)
-	}
-	nsPaths, err := c.orderNamespacePaths(state.NamespacePaths, false)
-	if err != nil {
-		return nil, newSystemError(err)
-	}
-	cmd.Env = append(cmd.Env,
-		fmt.Sprintf("_LIBCONTAINER_NSPATH=%s", strings.Join(nsPaths, ",")),
-		"_LIBCONTAINER_INITTYPE=setns",
-		"_LIBCONTAINER_DOCLONE=true",
-		"_LIBCONTAINER_SETSID=true",
-	)
-	if p.consolePath != "" {
-		cmd.Env = append(cmd.Env, "_LIBCONTAINER_CONSOLE_PATH="+p.consolePath)
-	}
-	// TODO: set on container for process management
-	return &setnsProcess{
-		cmd:           cmd,
-		cgroupPaths:   c.cgroupManager.GetPaths(),
-		childPipe:     childPipe,
-		parentPipe:    parentPipe,
-		childRevPipe:  childRevPipe,
-		parentRevPipe: parentRevPipe,
-		config:        c.newInitConfig(p),
-	}, nil
 }
 
 func (c *linuxContainer) newInitConfig(process *Process) *initConfig {

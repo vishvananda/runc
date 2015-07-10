@@ -42,150 +42,6 @@ type parentProcess interface {
 	chldDisabled() bool
 }
 
-type setnsProcess struct {
-	cmd           *exec.Cmd
-	parentPipe    *os.File
-	childPipe     *os.File
-	parentRevPipe *os.File
-	childRevPipe  *os.File
-	cgroupPaths   map[string]string
-	config        *initConfig
-	fds           []string
-	ignoreOneChld bool
-}
-
-func (p *setnsProcess) startTime() (string, error) {
-	return system.GetProcessStartTime(p.pid())
-}
-
-func (p *setnsProcess) signal(sig os.Signal) error {
-	s, ok := sig.(syscall.Signal)
-	if !ok {
-		return errors.New("os: unsupported signal type")
-	}
-	return syscall.Kill(p.cmd.Process.Pid, s)
-}
-
-func (p *setnsProcess) start() (err error) {
-	defer p.parentPipe.Close()
-	defer p.parentRevPipe.Close()
-	err = p.cmd.Start()
-	p.childPipe.Close()
-	p.childRevPipe.Close()
-	if err != nil {
-		return newSystemError(err)
-	}
-	// wait for the child to execute unshare
-	var data = make([]byte, 1)
-	_, err = p.parentPipe.Read(data)
-	if err != nil {
-		return newSystemError(err)
-	}
-
-	// no need to write mappings
-
-	// ignore the exit of the parent
-	p.ignoreOneChld = true
-
-	p.parentRevPipe.Close()
-	if err = p.execSetns(); err != nil {
-		return newSystemError(err)
-	}
-	if len(p.cgroupPaths) > 0 {
-		if err := cgroups.EnterPid(p.cgroupPaths, p.cmd.Process.Pid); err != nil {
-			return newSystemError(err)
-		}
-	}
-	if err := json.NewEncoder(p.parentPipe).Encode(p.config); err != nil {
-		return newSystemError(err)
-	}
-	if err := syscall.Shutdown(int(p.parentPipe.Fd()), syscall.SHUT_WR); err != nil {
-		return newSystemError(err)
-	}
-	// wait for the child process to fully complete and receive an error message
-	// if one was encoutered
-	var ierr *genericError
-	if err := json.NewDecoder(p.parentPipe).Decode(&ierr); err != nil && err != io.EOF {
-		return newSystemError(err)
-	}
-	if ierr != nil {
-		return newSystemError(ierr)
-	}
-
-	return nil
-}
-
-// execSetns runs the process that executes C code to perform the setns calls
-// because setns support requires the C process to fork off a child and perform the setns
-// before the go runtime boots, we wait on the process to die and receive the child's pid
-// over the provided pipe.
-func (p *setnsProcess) execSetns() error {
-	status, err := p.cmd.Process.Wait()
-	if err != nil {
-		p.cmd.Wait()
-		return newSystemError(err)
-	}
-	if !status.Success() {
-		p.cmd.Wait()
-		return newSystemError(&exec.ExitError{ProcessState: status})
-	}
-	var pid *pid
-	if err := json.NewDecoder(p.parentPipe).Decode(&pid); err != nil {
-		p.cmd.Wait()
-		return newSystemError(err)
-	}
-
-	process, err := os.FindProcess(pid.Pid)
-	if err != nil {
-		return err
-	}
-
-	p.cmd.Process = process
-	return nil
-}
-
-// terminate sends a SIGKILL to the forked process for the setns routine then waits to
-// avoid the process becomming a zombie.
-func (p *setnsProcess) terminate() error {
-	if p.cmd.Process == nil {
-		return nil
-	}
-	err := p.cmd.Process.Kill()
-	if _, werr := p.wait(); err == nil {
-		err = werr
-	}
-	return err
-}
-
-func (p *setnsProcess) wait() (*os.ProcessState, error) {
-	err := p.cmd.Wait()
-	if err != nil {
-		return p.cmd.ProcessState, err
-	}
-
-	return p.cmd.ProcessState, nil
-}
-
-func (p *setnsProcess) pid() int {
-	return p.cmd.Process.Pid
-}
-
-func (p *setnsProcess) externalDescriptors() []string {
-	return p.fds
-}
-
-func (p *setnsProcess) setExternalDescriptors(newFds []string) {
-	p.fds = newFds
-}
-
-func (p *setnsProcess) chldDisabled() bool {
-	if(p.ignoreOneChld) {
-		p.ignoreOneChld = false
-		return true
-	}
-	return false
-}
-
 type initProcess struct {
 	cmd           *exec.Cmd
 	parentPipe    *os.File
@@ -193,10 +49,12 @@ type initProcess struct {
 	parentRevPipe *os.File
 	childRevPipe  *os.File
 	config        *initConfig
+	cgroupPaths   map[string]string
 	manager       cgroups.Manager
 	container     *linuxContainer
 	fds           []string
 	doClone       bool
+	doInit        bool
 	ignoreOneChld bool
 }
 
@@ -308,28 +166,37 @@ func (p *initProcess) start() error {
 			return newSystemError(err)
 		}
 	}
-	// Save the standard descriptor names before the container process
-	// can potentially move them (e.g., via dup2()).  If we don't do this now,
-	// we won't know at checkpoint time which file descriptor to look up.
-	fds, err := getPipeFds(p.pid())
-	if err != nil {
-		return newSystemError(err)
-	}
-	p.setExternalDescriptors(fds)
 
-	// Do this before syncing with child so that no children
-	// can escape the cgroup
-	if err := p.manager.Apply(p.pid()); err != nil {
-		return newSystemError(err)
-	}
-	defer func() {
+	if p.doInit {
+		// Save the standard descriptor names before the container process
+		// can potentially move them (e.g., via dup2()).  If we don't do this now,
+		// we won't know at checkpoint time which file descriptor to look up.
+		fds, err := getPipeFds(p.pid())
 		if err != nil {
-			// TODO: should not be the responsibility to call here
-			p.manager.Destroy()
+			return newSystemError(err)
 		}
-	}()
-	if err := p.createNetworkInterfaces(); err != nil {
-		return newSystemError(err)
+		p.setExternalDescriptors(fds)
+
+		// Do this before syncing with child so that no children
+		// can escape the cgroup
+		if err := p.manager.Apply(p.pid()); err != nil {
+			return newSystemError(err)
+		}
+		defer func() {
+			if err != nil {
+				// TODO: should not be the responsibility to call here
+				p.manager.Destroy()
+			}
+		}()
+		if err := p.createNetworkInterfaces(); err != nil {
+			return newSystemError(err)
+		}
+	} else {
+		if len(p.cgroupPaths) > 0 {
+			if err := cgroups.EnterPid(p.cgroupPaths, p.cmd.Process.Pid); err != nil {
+				return newSystemError(err)
+			}
+		}
 	}
 	if err := p.sendConfig(); err != nil {
 		return newSystemError(err)
@@ -352,12 +219,14 @@ func (p *initProcess) wait() (*os.ProcessState, error) {
 		return p.cmd.ProcessState, err
 	}
 	// we should kill all processes in cgroup when init is died if we use host PID namespace
-	if p.doClone && p.config.Config.Namespaces.PathOf(configs.NEWPID) == "" {
+	if p.doInit && p.doClone && p.config.Config.Namespaces.PathOf(configs.NEWPID) == "" {
 		killCgroupProcesses(p.manager)
 	}
 	return p.cmd.ProcessState, nil
 }
 
+// terminate sends a SIGKILL to the forked process for the setns routine then waits to
+// avoid the process becomming a zombie.
 func (p *initProcess) terminate() error {
 	if p.cmd.Process == nil {
 		return nil
@@ -429,7 +298,7 @@ func getPipeFds(pid int) ([]string, error) {
 }
 
 func (p *initProcess) chldDisabled() bool {
-	if(p.ignoreOneChld) {
+	if p.ignoreOneChld {
 		p.ignoreOneChld = false
 		return true
 	}
