@@ -56,6 +56,9 @@ func (h *signalHandler) forward(process *libcontainer.Process) (int, error) {
 		case syscall.SIGWINCH:
 			h.tty.resize()
 		case syscall.SIGCHLD:
+			if process.ChldDisabled() {
+				continue
+			}
 			exits, err := h.reap()
 			if err != nil {
 				logrus.Error(err)

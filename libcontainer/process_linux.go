@@ -38,6 +38,8 @@ type parentProcess interface {
 	externalDescriptors() []string
 
 	setExternalDescriptors(fds []string)
+
+	chldDisabled() bool
 }
 
 type setnsProcess struct {
@@ -49,6 +51,7 @@ type setnsProcess struct {
 	cgroupPaths   map[string]string
 	config        *initConfig
 	fds           []string
+	ignoreOneChld bool
 }
 
 func (p *setnsProcess) startTime() (string, error) {
@@ -80,6 +83,9 @@ func (p *setnsProcess) start() (err error) {
 	}
 
 	// no need to write mappings
+
+	// ignore the exit of the parent
+	p.ignoreOneChld = true
 
 	p.parentRevPipe.Close()
 	if err = p.execSetns(); err != nil {
@@ -172,6 +178,14 @@ func (p *setnsProcess) setExternalDescriptors(newFds []string) {
 	p.fds = newFds
 }
 
+func (p *setnsProcess) chldDisabled() bool {
+	if(p.ignoreOneChld) {
+		p.ignoreOneChld = false
+		return true
+	}
+	return false
+}
+
 type initProcess struct {
 	cmd           *exec.Cmd
 	parentPipe    *os.File
@@ -183,6 +197,7 @@ type initProcess struct {
 	container     *linuxContainer
 	fds           []string
 	doClone       bool
+	ignoreOneChld bool
 }
 
 func (p *initProcess) pid() int {
@@ -278,6 +293,12 @@ func (p *initProcess) start() error {
 	err = writeUidGidMappings(p.pid(), &sys)
 	if err != nil {
 		return newSystemError(err)
+	}
+
+	// don't handle signals during fork
+	if p.doClone {
+		// ignore the exit of the parent
+		p.ignoreOneChld = true
 	}
 	// close the reverse pipe so the child continues
 	p.parentRevPipe.Close()
@@ -405,4 +426,12 @@ func getPipeFds(pid int) ([]string, error) {
 		fds[i] = target
 	}
 	return fds, nil
+}
+
+func (p *initProcess) chldDisabled() bool {
+	if(p.ignoreOneChld) {
+		p.ignoreOneChld = false
+		return true
+	}
+	return false
 }

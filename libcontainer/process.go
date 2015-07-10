@@ -11,6 +11,7 @@ type processOperations interface {
 	wait() (*os.ProcessState, error)
 	signal(sig os.Signal) error
 	pid() int
+	chldDisabled() bool
 }
 
 // Process specifies the configuration and IO for a process inside
@@ -49,6 +50,14 @@ type Process struct {
 	Capabilities []string
 
 	ops processOperations
+}
+
+// Check if the process has disabled SIGCHLD handling
+func (p Process) ChldDisabled() bool {
+	if p.ops == nil {
+		return false
+	}
+	return p.ops.chldDisabled()
 }
 
 // Wait waits for the process to exit.
